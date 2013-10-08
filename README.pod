@@ -1,0 +1,19 @@
+=pod
+
+=head1 NAME
+
+cpanm-extras - some nice features cpanm doesn't provide yet
+
+=head1 DESCRIPTION
+
+Since some modules on CPAN require additional non-perl dependencies like C libs
+in most cases these dependencies must be installed manually. To face this
+problem cpanm-auto handles configure failures by searching for the required
+dependencies and install them via apt-get.
+
+=head1 DEPENDENCIES
+
+  apt-file
+
+=cut
+
