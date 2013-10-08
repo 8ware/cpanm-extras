@@ -5,153 +5,319 @@ use warnings;
 
 use feature 'say';
 
-# TODO use 'apt-file find <file>' to find header files in library
+use Getopt::Long;
 
+GetOptions('dryrun' => \our $DRYRUN);
 
-sub install($@);
-sub solve($);
-sub aptfind($$);
-sub aptinstall(@);
+=head1 NAME
 
+cpanm-aure - resolves non-perl dependencies automatically
 
-my $logregex = qr/See ($ENV{HOME}\/\.cpanm\/work\/\d+\.\d+\/build\.log) for details/;
-my %solutions = (
+=head1 SYNOPSIS
+
+  $ cpanm <module> [...]
+
+  # if failed
+  $ cpanm-aure && !!
+
+=cut
+
+# TODO distinguish between search_file and search_devlib
+
+package App::cpanminus::AutoResolution;
+
+sub resolve($);
+sub read_log($);
+sub select($);
+sub filter($%);
+sub disambiguate($%);
+
+my %SOLUTIONS = (
 	#
-	# resolve XML::LibXSLT dependencies to libxslt and libxml2
+#	# resolve XML::LibXSLT dependencies to libxslt and libxml2
+	# resolve XML::LibXSLT dependencies to libxslt
+	# ENCOUNTERED: XML::LibXSLT
 	#
-	qr/Or get (?<a>libxslt) and (?<b>libxml2)/ => sub {
-		my $installs = shift;
-		my %data = @_;
-		return aptfind("$data{a}-dev", $installs)
-				and aptfind("$data{b}-dev", $installs);
+#	qr/Or get (?<lib1>libxslt) and (?<lib2>libxml2)/ => sub {
+	qr/Or get (?<lib>libxslt)/ => sub {
+		my ($lineno, $line, $packages, %data) = @_;
+
+#		return determine("$data{lib1}-dev", $packages)
+#				and determine("$data{lib2}-dev", $packages);
+		return determine_devlib($data{lib}, $packages);
 	},
+
 	#
 	# resolve XML::LibXML dependency to libxml2
+	# ENCOUNTERED: XML::LibXML
 	#
-	qr/Or get (?<a>libxml2)/ => sub {
-		my $installs = shift;
-		my %data = @_;
-		return aptfind("$data{a}-dev", $installs);
+	qr/Or get (?<lib>libxml2)/ => sub {
+		my ($lineno, $line, $packages, %data) = @_;
+
+		return determine_devlib($data{lib}, $packages);
 	},
+
 	#
 	# to resolve dependencies to shared libraries automatically
+	# SEE ALSO: ld manpage, -l option
+	# ENCOUNTERED: XML::LibXSLT
 	#
 	qr/\/usr\/bin\/ld: cannot find -l(?<lib>.+)/ => sub {
-		my $installs = shift;
-		my %data = @_;
-		return aptfind("lib$data{lib}-dev", $installs);
-	}
+		my ($lineno, $line, $packages, %data) = @_;
+
+		return determine_devlib("lib$data{lib}", $packages);
+	},
+
+	#
+	# resolve dependencies which are specified by required files,
+	# e.g. executables
+	# ENCOUNTERED: App::Framework::Feature::Sql
+	#
+	qr/Can't exec "(?<cmd>.+)": No such file/ => sub {
+		my ($lineno, $line, $packages, %data) = @_;
+
+		return determine_file($data{cmd}, $packages);
+	},
+
+	#
+	# calls attention for optional modules
+	# ENCOUNTERED: App::Framework
+	#
+	qr/Enter your choices, separated by spaces \(0=none, a=all\): \[a\] a/ => sub {
+		my ($lineno, $line, $packages, %data) = @_;
+
+		say "it seems that the module has asked to choose some optional modules.";
+		say "since cpanm chooses 'all' by default you could run cpanm in interactive";
+		say "mode by using the '--interactive' option. see line $lineno and above";
+		say "for more information.";
+	},
 );
 
 
-install(1, @ARGV);
+package main;
+
+my $log = $ARGV[0] && -f $ARGV[0] ? shift : "$ENV{HOME}/.cpanm/build.log";
+unless (@ARGV) {
+	my ($status, @packages) = App::cpanminus::AutoResolution->resolve($log);
+
+	exit 1 unless $status;
+	exit Apt::Get->install(@packages);
+}
 
 
-sub install($@) {
-	my $retry = shift;
-	my @args = @_;
-	
-	open EXEC, "cpanm @ARGV 2>&1 |" or die "cannot open pipe: $!";
-	while (<EXEC>) {
+sub cpanm(@) {
+	open CPANM, "cpanm @_ 2>&1 |" or die "cannot fork cpanm: $!";
+	while (<CPANM>) {
 		print;
 		chomp;
-		if ($retry and /$logregex/) {
-			say "trying to solve and install $args[0] again..." if $retry;
-			solve($1) and install(0, @args) if $retry;
-		}
+		next unless /^! Configure failed for (.+)\. See (.+\/build\.log)/;
+
+		my ($module, $buildlog) = ($1, $2);
+		say "--> Trying to resolve $module automatically";
+		App::cpanminus::AutoResolution->resolve($buildlog);
 	}
-	close EXEC or warn "cannot close pipe: $!";
+	close CPANM or warn "cannot close cpanm: $!";
 }
 
-sub solve($) {
+#cpanm(@ARGV);
+
+
+package App::cpanminus::AutoResolution;
+
+use Text::Levenshtein 'distance';
+use List::MoreUtils 'uniq';
+
+sub resolve($) {
+	shift if $_[0] eq __PACKAGE__;
 	my $buildlog = shift;
 
-	open LOG, '<', $buildlog or die $!;
-	my @lines = <LOG>;
-	close LOG or warn $!;
-
 	my $status = 1;
-	my @installs;
-	for (@lines) {
-		while (my ($indicator, $solution) = each %solutions) {
-			$status &= $solution->(\@installs, %+) if /$indicator/;
+	my $lineno = 1;
+	my %packages;
+	for (read_log($buildlog)) {
+		while (my ($indicator, $solution) = each %SOLUTIONS) {
+			$status &= $solution->($lineno, $_, \%packages, %+) if /$indicator/;
 		}
+		$lineno++;
 	}
 
-	$status &= aptinstall(@installs);
-	return $status;
+	return $status, uniq(values %packages);
 }
 
-sub aptfind($$) {
+sub read_log($) {
+	my $buildlog = shift;
+
+	open LOG, '<', $buildlog or die "cannot open $buildlog: $!";
+	my @lines = <LOG>;
+	close LOG or warn "cannot close $buildlog: $!";
+	
+	return @lines;
+}
+
+sub determine_file($$) {
+	my $file = shift;
+	my $packages = shift;
+
+	return 1 if defined $packages->{$file};
+
+	say "  > Searching for $file";
+	my $obj = create_obj($file, $packages);
+	my $package = search_libs($obj);
+	
+	unless ($package) {
+		say "  > NOTHING FOUND";
+		return 0;
+	}
+
+	$packages->{$file} = $package;
+	return 1;
+}
+
+sub determine_devlib($$) {
 	my $lib = shift;
-	my $installs = shift;
+	my $packages = shift;
 
-	say "searching for $lib";
+	return 1 if defined $packages->{$lib};
 
-	chomp (my @matches = split /\n/, `apt-cache search --names-only $lib`);
-	@matches = map { s/\s.+//; $_ } @matches;
-	if (@matches == 1) {
-		say "found $matches[0]...";
-		push $installs, $matches[0] unless $matches[0] ~~ @{$installs};
-		return 1;
-	} elsif (@matches == 0) {
-		say "found nothing. try to find files...";
-		my ($file) = $lib =~ /(.+)-dev$/;
-		chomp (@matches = split /\n/, `apt-file find $file`);
-		my %matches = map { /([^:]+):\s+.+\/(.+)/; $1 => $2 } @matches;
-		@matches = grep { /-dev$/ } keys %matches;
-		if (@matches == 1) {
-			say "found $matches[0]...";
-			push $installs, $matches[0] unless $matches[0] ~~ @{$installs};
-			return 1;
-		} elsif (@matches == 0) {
-			say "found really nothing...fuck!";
-		} else {
-			say "disambiguate: @matches";
-			my $most_similar = "";
-			for (@matches) {
-				say "checking $_ => $matches{$_}";
-				if ($_ eq $lib or $_ eq $file) {
-					$most_similar = $_;
-					last;
-				} elsif ($file =~ /$matches{$_}\.(a|so)$/) {
-					$most_similar = $_;
-				} elsif ($_ ~~ @{$installs}) {
-					$most_similar = $_;
-				}
-			}
-			say "found $most_similar...";
-			push $installs, $most_similar unless $most_similar ~~ @{$installs};
-			return 1;
-		}
-	} else {
-		say "found ambiguous stuff...";
-		my $most_similar = "";
-		for (@matches) {
-			say "compare $_ with $lib";
-			# TODO use levenshtein distance
-			if ($_ eq $lib) {
-				$most_similar = $_;
-				last;
-			} elsif (length $lib == length and length $most_similar > length
-					or length $lib < length and length $most_similar > length) {
-				$most_similar = $_;
-			}
-		}
-		unless ($most_similar) {
-			say "cannot determine right one: @matches";
-		} else {
-			say "found $most_similar...";
-			push $installs, $matches[0] unless $most_similar ~~ @{$installs};
-			return 1;
+	say "  > Searching for $lib";
+
+	my $obj = create_obj($lib, $packages);
+	my $package = search_pkgs($obj);
+	$package = search_libs($obj) unless $package;
+	
+	unless ($package) {
+		say "  > NOTHING FOUND";
+		return 0;
+	}
+
+	$packages->{$lib} = $package;
+	return 1;
+}
+
+sub create_obj($$) {
+	my $lib = shift;
+	my $pkgs = shift;
+
+	return { lib => $lib, pkg => "$lib-dev", pkgs => $pkgs };
+}
+
+sub search_pkgs($) {
+	my $obj = shift;
+
+	return search($obj, map { $_ => [] } Apt::Cache->search($obj->{pkg}));
+}
+
+sub search_libs($) {
+	my $obj = shift;
+
+	return search($obj, Apt::File->find($obj->{lib}));
+}
+
+sub search($%) {
+	my $obj = shift;
+	my %matches = @_;
+
+	%matches = filter(qr/-dev$/, %matches);
+
+	return keys %matches ? disambiguate($obj, %matches) : undef;
+}
+
+sub filter($%) {
+	my $regex = shift;
+	my %hash = @_;
+
+	my %filtered;
+	while (my ($key, $value) = each %hash) {
+		$filtered{$key} = $value if $key =~ /$regex/;
+	}
+
+	return %filtered;
+}
+
+sub disambiguate($%) {
+	my $obj = shift;
+	my %matches = @_;
+
+	my $lib = $obj->{lib};
+	my $pkg = $obj->{pkg};
+	my @packages = values %{$obj->{pkgs}};
+	my @matches = keys %matches;
+
+	return shift @matches if @matches == 1;
+
+	say "  > Disambiguate: @matches";
+
+	my $most_similar = "";
+	for (@matches) {
+		if ($_ eq $lib or $_ eq $pkg) {
+			$most_similar = $_;
+			last;
+		} elsif (matches($lib, $matches{$_}) or $_ ~~ @packages
+				or distance($_, $pkg) < distance($most_similar, $pkg)
+				or length $lib == length and length $most_similar > length
+				or length $lib < length and length $most_similar > length) {
+			$most_similar = $_;
 		}
 	}
+
+	return $most_similar;
+}
+
+sub matches($$) {
+	my $string = shift;
+	my @values = @{(shift)};
+
+	for (@values) {
+		return 1 if $string =~ /$_(\.(a|so))?$/;
+	}
+
 	return 0;
 }
 
-sub aptinstall(@) {
-	my @installs = @_;
-	say "installing @installs";
-	return not system "sudo apt-get install @installs";
+
+package Apt::Cache;
+
+sub search($) {
+	shift if $_[0] eq __PACKAGE__;
+	my $pattern = shift;
+
+	my @packages;
+	for (split /\n/, `apt-cache search --names-only $pattern`) {
+		chomp; # XXX is this really necessary due to split /\n/?
+		push @packages, s/\s+-\s+.+//r;
+	}
+
+	return @packages;
+}
+
+
+package Apt::File;
+
+sub find($) {
+	shift if $_[0] eq __PACKAGE__;
+	my $pattern = shift;
+
+	my %results;
+	for (split /\n/, `apt-file find $pattern`) {
+		chomp; # XXX is this really necessary due to split /\n/?
+		my ($package, $file) = /([^:]+):\s+.+\/(.+)/;
+		$results{$package} = [] unless defined $results{$package};
+		push $results{$package}, $file;
+	}
+
+	return %results;
+}
+
+
+package Apt::Get;
+
+sub install(@) {
+	shift if $_[0] eq __PACKAGE__;
+	my @packages = @_;
+
+	return 1 unless @packages;
+
+	say join "\n  ", "--> following packages were installed:", @packages;
+	return $main::DRYRUN ? 0 : system "sudo apt-get install @packages";
 }
 
