@@ -1,0 +1,53 @@
+#! /usr/bin/env perl
+
+use strict;
+use warnings;
+
+use feature 'say';
+
+
+use FindBin;
+use lib "$FindBin::Bin/cpanminus/lib";
+use lib "$FindBin::Bin/cpanminus/fatlib";
+use App::cpanminus::script;
+
+
+no strict 'refs';
+no warnings;
+
+my $origin_diag_fail = \&{'App::cpanminus::script::diag_fail'};
+*{'App::cpanminus::script::diag_fail'} = sub {
+	my($self, $msg, $always) = @_;
+
+	$origin_diag_fail->($self, $msg, $always);
+
+	$self->autoresolve($1) if $msg =~ /Configure failed for (.+)\. See/;
+};
+
+*{'App::cpanminus::script::autoresolve'} = sub {
+	my $self = shift;
+
+	$self->diag("--> Trying to resolve $1\n");
+
+	my @lines;
+	unless (open LOG, '<', $self->{log}) {
+		warn "cannot open $self->{log}: $!";
+		return 0;
+	} else {
+		@lines = <LOG>;
+		close LOG or warn "cannot close $self->{log}: $!";
+	}
+
+	say "log contains " . @lines . " lines";
+};
+
+use strict 'refs';
+use warnings;
+
+
+unless (caller) {
+	my $app = App::cpanminus::script->new();
+	$app->parse_options(@ARGV);
+	exit $app->doit();
+}
+
