@@ -1,0 +1,157 @@
+#! /usr/bin/env perl
+
+use strict;
+use warnings;
+
+use feature 'say';
+
+# TODO use 'apt-file find <file>' to find header files in library
+
+
+sub install($@);
+sub solve($);
+sub aptfind($$);
+sub aptinstall(@);
+
+
+my $logregex = qr/See ($ENV{HOME}\/\.cpanm\/work\/\d+\.\d+\/build\.log) for details/;
+my %solutions = (
+	#
+	# resolve XML::LibXSLT dependencies to libxslt and libxml2
+	#
+	qr/Or get (?<a>libxslt) and (?<b>libxml2)/ => sub {
+		my $installs = shift;
+		my %data = @_;
+		return aptfind("$data{a}-dev", $installs)
+				and aptfind("$data{b}-dev", $installs);
+	},
+	#
+	# resolve XML::LibXML dependency to libxml2
+	#
+	qr/Or get (?<a>libxml2)/ => sub {
+		my $installs = shift;
+		my %data = @_;
+		return aptfind("$data{a}-dev", $installs);
+	},
+	#
+	# to resolve dependencies to shared libraries automatically
+	#
+	qr/\/usr\/bin\/ld: cannot find -l(?<lib>.+)/ => sub {
+		my $installs = shift;
+		my %data = @_;
+		return aptfind("lib$data{lib}-dev", $installs);
+	}
+);
+
+
+install(1, @ARGV);
+
+
+sub install($@) {
+	my $retry = shift;
+	my @args = @_;
+	
+	open EXEC, "cpanm @ARGV 2>&1 |" or die "cannot open pipe: $!";
+	while (<EXEC>) {
+		print;
+		chomp;
+		if ($retry and /$logregex/) {
+			say "trying to solve and install $args[0] again..." if $retry;
+			solve($1) and install(0, @args) if $retry;
+		}
+	}
+	close EXEC or warn "cannot close pipe: $!";
+}
+
+sub solve($) {
+	my $buildlog = shift;
+
+	open LOG, '<', $buildlog or die $!;
+	my @lines = <LOG>;
+	close LOG or warn $!;
+
+	my $status = 1;
+	my @installs;
+	for (@lines) {
+		while (my ($indicator, $solution) = each %solutions) {
+			$status &= $solution->(\@installs, %+) if /$indicator/;
+		}
+	}
+
+	$status &= aptinstall(@installs);
+	return $status;
+}
+
+sub aptfind($$) {
+	my $lib = shift;
+	my $installs = shift;
+
+	say "searching for $lib";
+
+	chomp (my @matches = split /\n/, `apt-cache search --names-only $lib`);
+	@matches = map { s/\s.+//; $_ } @matches;
+	if (@matches == 1) {
+		say "found $matches[0]...";
+		push $installs, $matches[0] unless $matches[0] ~~ @{$installs};
+		return 1;
+	} elsif (@matches == 0) {
+		say "found nothing. try to find files...";
+		my ($file) = $lib =~ /(.+)-dev$/;
+		chomp (@matches = split /\n/, `apt-file find $file`);
+		my %matches = map { /([^:]+):\s+.+\/(.+)/; $1 => $2 } @matches;
+		@matches = grep { /-dev$/ } keys %matches;
+		if (@matches == 1) {
+			say "found $matches[0]...";
+			push $installs, $matches[0] unless $matches[0] ~~ @{$installs};
+			return 1;
+		} elsif (@matches == 0) {
+			say "found really nothing...fuck!";
+		} else {
+			say "disambiguate: @matches";
+			my $most_similar = "";
+			for (@matches) {
+				say "checking $_ => $matches{$_}";
+				if ($_ eq $lib or $_ eq $file) {
+					$most_similar = $_;
+					last;
+				} elsif ($file =~ /$matches{$_}\.(a|so)$/) {
+					$most_similar = $_;
+				} elsif ($_ ~~ @{$installs}) {
+					$most_similar = $_;
+				}
+			}
+			say "found $most_similar...";
+			push $installs, $most_similar unless $most_similar ~~ @{$installs};
+			return 1;
+		}
+	} else {
+		say "found ambiguous stuff...";
+		my $most_similar = "";
+		for (@matches) {
+			say "compare $_ with $lib";
+			# TODO use levenshtein distance
+			if ($_ eq $lib) {
+				$most_similar = $_;
+				last;
+			} elsif (length $lib == length and length $most_similar > length
+					or length $lib < length and length $most_similar > length) {
+				$most_similar = $_;
+			}
+		}
+		unless ($most_similar) {
+			say "cannot determine right one: @matches";
+		} else {
+			say "found $most_similar...";
+			push $installs, $matches[0] unless $most_similar ~~ @{$installs};
+			return 1;
+		}
+	}
+	return 0;
+}
+
+sub aptinstall(@) {
+	my @installs = @_;
+	say "installing @installs";
+	return not system "sudo apt-get install @installs";
+}
+
