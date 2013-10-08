@@ -13,7 +13,23 @@ dependencies and install them via apt-get.
 
 =head1 DEPENDENCIES
 
-  apt-file
+=head2 Packages (Debian)
+
+=over 4
+
+=item apt-file
+
+=back
+
+=head2 Modules (CPAN)
+
+=over 4
+
+=item Text::Levenshtein
+
+=item List::MoreUtils
+
+=back
 
 =cut
 
